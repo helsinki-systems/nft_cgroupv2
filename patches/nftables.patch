@@ -1,0 +1,225 @@
+From e4ec88dc8960b6307d3c0f7cb878661149c4fe3a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Janne=20He=C3=9F?= <janne@hess.ooo>
+Date: Wed, 19 Aug 2020 21:39:24 +0200
+Subject: [PATCH] Add support for cgroup v2 matches
+
+Based off 17ee0ff0af71ace44f8e48ffce5f272fb334b749
+---
+ include/statement.h       |  9 +++++++++
+ src/evaluate.c            |  2 ++
+ src/netlink_delinearize.c | 14 ++++++++++++++
+ src/netlink_linearize.c   | 17 +++++++++++++++++
+ src/parser_bison.y        | 12 ++++++++++++
+ src/scanner.l             |  2 ++
+ src/statement.c           | 22 ++++++++++++++++++++++
+ 7 files changed, 78 insertions(+)
+
+diff --git a/include/statement.h b/include/statement.h
+index 7d96b394..4e8c6e2a 100644
+--- a/include/statement.h
++++ b/include/statement.h
+@@ -229,6 +229,12 @@ struct meter_stmt {
+ 
+ extern struct stmt *meter_stmt_alloc(const struct location *loc);
+ 
++struct cgroupv2_stmt {
++	const char	*text;
++};
++
++extern struct stmt *cgroupv2_stmt_alloc(const struct location *loc);
++
+ /**
+  * enum nft_xt_type - xtables statement types
+  *
+@@ -287,6 +293,7 @@ extern struct stmt *xt_stmt_alloc(const struct location *loc);
+  * @STMT_CONNLIMIT:	connection limit statement
+  * @STMT_MAP:		map statement
+  * @STMT_SYNPROXY:	synproxy statement
++ * @STMT_CGROUPV2	cgroupv2 statement
+  */
+ enum stmt_types {
+ 	STMT_INVALID,
+@@ -315,6 +322,7 @@ enum stmt_types {
+ 	STMT_CONNLIMIT,
+ 	STMT_MAP,
+ 	STMT_SYNPROXY,
++	STMT_CGROUPV2,
+ };
+ 
+ /**
+@@ -380,6 +388,7 @@ struct stmt {
+ 		struct flow_stmt	flow;
+ 		struct map_stmt		map;
+ 		struct synproxy_stmt	synproxy;
++		struct cgroupv2_stmt	cgroupv2;
+ 	};
+ };
+ 
+diff --git a/src/evaluate.c b/src/evaluate.c
+index 42040b6e..9d980937 100644
+--- a/src/evaluate.c
++++ b/src/evaluate.c
+@@ -3440,6 +3440,8 @@ int stmt_evaluate(struct eval_ctx *ctx, struct stmt *stmt)
+ 		return stmt_evaluate_map(ctx, stmt);
+ 	case STMT_SYNPROXY:
+ 		return stmt_evaluate_synproxy(ctx, stmt);
++	case STMT_CGROUPV2:
++		return 0; // Don't perform any checks
+ 	default:
+ 		BUG("unknown statement type %s\n", stmt->ops->name);
+ 	}
+diff --git a/src/netlink_delinearize.c b/src/netlink_delinearize.c
+index 8de4830c..b1a36487 100644
+--- a/src/netlink_delinearize.c
++++ b/src/netlink_delinearize.c
+@@ -1594,6 +1594,19 @@ static void netlink_parse_objref(struct netlink_parse_ctx *ctx,
+ 	ctx->stmt = stmt;
+ }
+ 
++static void netlink_parse_cgroupv2(struct netlink_parse_ctx *ctx, const struct location *loc, const struct nftnl_expr *expr)
++{
++	struct stmt *stmt = cgroupv2_stmt_alloc(loc);
++	const char *cgroup = nftnl_expr_get_str(expr, NFTNL_EXPR_CGROUPV2_CGROUP);
++	uint8_t invert = nftnl_expr_get_u8(expr, NFTNL_EXPR_CGROUPV2_INVERT);
++	char *text;
++
++	text = malloc(strlen(cgroup) + (invert ? 1 : 0) + 1);
++	sprintf(text, "%s%s", (invert ? "^" : ""), cgroup);
++	stmt->cgroupv2.text = text;
++	ctx->stmt = stmt;
++}
++
+ static const struct {
+ 	const char	*name;
+ 	void		(*parse)(struct netlink_parse_ctx *ctx,
+@@ -1638,6 +1651,7 @@ static const struct {
+ 	{ .name = "flow_offload", .parse = netlink_parse_flow_offload },
+ 	{ .name = "xfrm",	.parse = netlink_parse_xfrm },
+ 	{ .name = "synproxy",	.parse = netlink_parse_synproxy },
++	{ .name = "cgroupv2",	.parse = netlink_parse_cgroupv2 },
+ };
+ 
+ static int netlink_parse_expr(const struct nftnl_expr *nle,
+diff --git a/src/netlink_linearize.c b/src/netlink_linearize.c
+index 08f7f89f..e3a8f5cf 100644
+--- a/src/netlink_linearize.c
++++ b/src/netlink_linearize.c
+@@ -1442,6 +1442,21 @@ static void netlink_gen_meter_stmt(struct netlink_linearize_ctx *ctx,
+ 	nftnl_rule_add_expr(ctx->nlr, nle);
+ }
+ 
++static void netlink_gen_cgroupv2_stmt(struct netlink_linearize_ctx *ctx, const struct stmt *stmt)
++{
++	struct nftnl_expr *nle;
++	uint8_t invert;
++	nle = alloc_nft_expr("cgroupv2");
++
++	if (stmt->cgroupv2.text != NULL) {
++		invert = stmt->cgroupv2.text[0] == '^';
++		nftnl_expr_set_str(nle, NFTNL_EXPR_CGROUPV2_CGROUP, stmt->cgroupv2.text + (invert ? 1 : 0));
++		nftnl_expr_set_u8(nle, NFTNL_EXPR_CGROUPV2_INVERT, invert);
++	}
++
++	nftnl_rule_add_expr(ctx->nlr, nle);
++}
++
+ static void netlink_gen_stmt(struct netlink_linearize_ctx *ctx,
+ 			     const struct stmt *stmt)
+ {
+@@ -1495,6 +1510,8 @@ static void netlink_gen_stmt(struct netlink_linearize_ctx *ctx,
+ 		return netlink_gen_objref_stmt(ctx, stmt);
+ 	case STMT_MAP:
+ 		return netlink_gen_map_stmt(ctx, stmt);
++	case STMT_CGROUPV2:
++		return netlink_gen_cgroupv2_stmt(ctx, stmt);
+ 	default:
+ 		BUG("unknown statement type %s\n", stmt->ops->name);
+ 	}
+diff --git a/src/parser_bison.y b/src/parser_bison.y
+index 461d9bf2..b769a250 100644
+--- a/src/parser_bison.y
++++ b/src/parser_bison.y
+@@ -565,6 +565,8 @@ int nft_lex(void *, void *, void *);
+ %token IN			"in"
+ %token OUT			"out"
+ 
++%token CGROUPV2		"cgroupv2"
++
+ %type <string>			identifier type_identifier string comment_spec
+ %destructor { xfree($$); }	identifier type_identifier string comment_spec
+ 
+@@ -659,6 +661,9 @@ int nft_lex(void *, void *, void *);
+ %type <stmt>			meter_stmt meter_stmt_alloc flow_stmt_legacy_alloc
+ %destructor { stmt_free($$); }	meter_stmt meter_stmt_alloc flow_stmt_legacy_alloc
+ 
++%type <stmt>			cgroupv2_stmt cgroupv2_stmt_alloc
++%destructor { stmt_free($$); }	cgroupv2_stmt cgroupv2_stmt_alloc
++
+ %type <expr>			symbol_expr verdict_expr integer_expr variable_expr chain_expr policy_expr
+ %destructor { expr_free($$); }	symbol_expr verdict_expr integer_expr variable_expr chain_expr policy_expr
+ %type <expr>			primary_expr shift_expr and_expr typeof_expr
+@@ -2527,6 +2532,7 @@ stmt			:	verdict_stmt
+ 			|	set_stmt
+ 			|	map_stmt
+ 			|	synproxy_stmt
++			|	cgroupv2_stmt
+ 			;
+ 
+ verdict_stmt		:	verdict_expr
+@@ -5089,4 +5095,10 @@ exthdr_key		:	HBH	{ $$ = IPPROTO_HOPOPTS; }
+ 			|	MH	{ $$ = IPPROTO_MH; }
+ 			;
+ 
++cgroupv2_stmt		:	cgroupv2_stmt_alloc	cgroupv2_opts;
++
++cgroupv2_stmt_alloc	:	CGROUPV2 { $$ = cgroupv2_stmt_alloc(&@$); };
++
++cgroupv2_opts	:	string { $<stmt>0->cgroupv2.text = $1; };
++
+ %%
+diff --git a/src/scanner.l b/src/scanner.l
+index 45699c85..66bc5691 100644
+--- a/src/scanner.l
++++ b/src/scanner.l
+@@ -592,6 +592,8 @@ addrstring	({macaddr}|{ip4addr}|{ip6addr})
+ "in"			{ return IN; }
+ "out"			{ return OUT; }
+ 
++"cgroupv2"		{ return CGROUPV2; }
++
+ "secmark"		{ return SECMARK; }
+ "secmarks"		{ return SECMARKS; }
+ 
+diff --git a/src/statement.c b/src/statement.c
+index 21a1bc8d..811393d0 100644
+--- a/src/statement.c
++++ b/src/statement.c
+@@ -946,3 +946,25 @@ struct stmt *synproxy_stmt_alloc(const struct location *loc)
+ {
+ 	return stmt_alloc(loc, &synproxy_stmt_ops);
+ }
++
++static void cgroupv2_stmt_print(const struct stmt *stmt, struct output_ctx *octx)
++{
++	nft_print(octx, "cgroupv2 \"%s\"", stmt->cgroupv2.text);
++}
++
++static void cgroupv2_stmt_destroy(struct stmt *stmt)
++{
++	xfree(stmt->cgroupv2.text);
++}
++
++static const struct stmt_ops cgroupv2_stmt_ops = {
++	.type = STMT_CGROUPV2,
++	.name = "cgroupv2",
++	.print = cgroupv2_stmt_print,
++	.destroy = cgroupv2_stmt_destroy,
++};
++
++struct stmt *cgroupv2_stmt_alloc(const struct location *loc)
++{
++	return stmt_alloc(loc, &cgroupv2_stmt_ops);
++}
+-- 
+2.25.4
+

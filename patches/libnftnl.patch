@@ -1,0 +1,226 @@
+From 364a4f26db1cfcd96b8c2e74ca1a778d02d21668 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Janne=20He=C3=9F?= <janne@hess.ooo>
+Date: Wed, 19 Aug 2020 21:36:44 +0200
+Subject: [PATCH] Add support for cgroup v2 matches
+
+Based off eedafeb6db330b8adff1b7cdd3dac325f9144195
+---
+ include/libnftnl/expr.h            |   5 ++
+ include/linux/netfilter/cgroupv2.h |  13 +++
+ src/Makefile.am                    |   1 +
+ src/expr/cgroupv2.c                | 134 +++++++++++++++++++++++++++++
+ src/expr_ops.c                     |   2 +
+ 5 files changed, 155 insertions(+)
+ create mode 100644 include/linux/netfilter/cgroupv2.h
+ create mode 100644 src/expr/cgroupv2.c
+
+diff --git a/include/libnftnl/expr.h b/include/libnftnl/expr.h
+index cfe456d..04ce1f5 100644
+--- a/include/libnftnl/expr.h
++++ b/include/libnftnl/expr.h
+@@ -299,6 +299,11 @@ enum {
+ 	NFTNL_EXPR_SYNPROXY_FLAGS,
+ };
+ 
++enum {
++	NFTNL_EXPR_CGROUPV2_CGROUP = NFTNL_EXPR_BASE,
++	NFTNL_EXPR_CGROUPV2_INVERT,
++};
++
+ #ifdef __cplusplus
+ } /* extern "C" */
+ #endif
+diff --git a/include/linux/netfilter/cgroupv2.h b/include/linux/netfilter/cgroupv2.h
+new file mode 100644
+index 0000000..1ede601
+--- /dev/null
++++ b/include/linux/netfilter/cgroupv2.h
+@@ -0,0 +1,13 @@
++#ifndef _NFT_CGROUPV2_H
++#define _NFT_CGROUPV2_H
++
++enum nft_cgroupv2_attributes {
++	NFTA_CGROUPV2_UNSPEC,
++	NFTA_CGROUPV2_CGROUP,
++	NFTA_CGROUPV2_INVERT,
++	__NFTA_CGROUPV2_MAX,
++};
++
++#define NFTA_CGROUPV2_MAX (__NFTA_CGROUPV2_MAX - 1)
++
++#endif /* _NFT_CGROUPV2_H */
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 90b1967..675dac9 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -23,6 +23,7 @@ libnftnl_la_SOURCES = utils.c		\
+ 		      expr_ops.c	\
+ 		      expr/bitwise.c	\
+ 		      expr/byteorder.c	\
++		      expr/cgroupv2.c	\
+ 		      expr/cmp.c	\
+ 		      expr/range.c	\
+ 		      expr/connlimit.c	\
+diff --git a/src/expr/cgroupv2.c b/src/expr/cgroupv2.c
+new file mode 100644
+index 0000000..276b91f
+--- /dev/null
++++ b/src/expr/cgroupv2.c
+@@ -0,0 +1,134 @@
++#include <stdio.h>
++#include <errno.h>
++
++#include <linux/netfilter/cgroupv2.h>
++
++#include "internal.h"
++#include <libmnl/libmnl.h>
++#include <libnftnl/expr.h>
++
++// Expression private data
++struct nftnl_expr_cgroupv2 {
++	const char *cgroup;
++	uint8_t invert;
++};
++
++// Set an attribute
++static int nftnl_expr_cgroupv2_set(struct nftnl_expr *e, uint16_t type, const void *data, uint32_t data_len) {
++	struct nftnl_expr_cgroupv2 *cgr = nftnl_expr_data(e);
++
++	switch (type) {
++		case NFTNL_EXPR_CGROUPV2_CGROUP:
++			cgr->cgroup = strdup(data);
++			if (!cgr->cgroup)
++				return -1;
++			break;
++		case NFTNL_EXPR_CGROUPV2_INVERT:
++			memcpy(&cgr->invert, data, sizeof(cgr->invert));
++			break;
++	}
++	return 0;
++}
++
++// Extract an attribute
++static const void *nftnl_expr_cgroupv2_get(const struct nftnl_expr *e, uint16_t type, uint32_t *data_len) {
++	struct nftnl_expr_cgroupv2 *cgr = nftnl_expr_data(e);
++
++	switch (type) {
++		case NFTNL_EXPR_CGROUPV2_CGROUP:
++			*data_len = strlen(cgr->cgroup) + 1;
++			return cgr->cgroup;
++		case NFTNL_EXPR_CGROUPV2_INVERT:
++			*data_len = sizeof(cgr->invert);
++			return &cgr->invert;
++	}
++
++	return NULL;
++}
++
++// Validation callback
++static int nftnl_expr_cgroupv2_cb(const struct nlattr *attr, void *data) {
++	const struct nlattr **tb = data;
++	int type = mnl_attr_get_type(attr);
++
++	if (mnl_attr_type_valid(attr, NFTA_CGROUPV2_MAX) < 0)
++		return MNL_CB_OK;
++
++	switch (type) {
++	case NFTNL_EXPR_CGROUPV2_CGROUP:
++		if (mnl_attr_validate(attr, MNL_TYPE_STRING) < 0)
++			abi_breakage();
++		break;
++	case NFTNL_EXPR_CGROUPV2_INVERT:
++		if (mnl_attr_validate(attr, MNL_TYPE_U8) < 0)
++			abi_breakage();
++		break;
++	}
++
++	tb[type] = attr;
++	return MNL_CB_OK;
++}
++
++// Parse an expression from netlink (I guess)
++static int nftnl_expr_cgroupv2_parse(struct nftnl_expr *e, struct nlattr *attr) {
++	struct nftnl_expr_cgroupv2 *cgr = nftnl_expr_data(e);
++	struct nlattr *tb[NFTA_CGROUPV2_MAX+1] = {};
++
++	// Do weird validation (?) stuff?
++	if (mnl_attr_parse_nested(attr, nftnl_expr_cgroupv2_cb, tb) < 0)
++		return -1;
++
++	// Handle cgroup
++	if (tb[NFTNL_EXPR_CGROUPV2_CGROUP]) {
++		if (cgr->cgroup)
++			xfree(cgr->cgroup);
++
++		cgr->cgroup = strdup(mnl_attr_get_str(tb[NFTNL_EXPR_CGROUPV2_CGROUP]));
++		if (!cgr->cgroup)
++			return -1;
++		e->flags |= (1 << NFTNL_EXPR_CGROUPV2_CGROUP);
++	}
++
++	// Handle invert flag
++	if (tb[NFTNL_EXPR_CGROUPV2_INVERT]) {
++		cgr->invert = mnl_attr_get_u8(tb[NFTNL_EXPR_CGROUPV2_INVERT]);
++		e->flags |= (1 << NFTNL_EXPR_CGROUPV2_INVERT);
++	}
++
++	return 0;
++}
++
++// Build a new expression
++static void nftnl_expr_cgroupv2_build(struct nlmsghdr *nlh, const struct nftnl_expr *e) {
++	struct nftnl_expr_cgroupv2 *cgr = nftnl_expr_data(e);
++
++	if (e->flags & (1 << NFTNL_EXPR_CGROUPV2_CGROUP))
++		mnl_attr_put_strz(nlh, NFTNL_EXPR_CGROUPV2_CGROUP, cgr->cgroup);
++	mnl_attr_put_u8(nlh, NFTNL_EXPR_CGROUPV2_INVERT, cgr->invert);
++}
++
++// Print the expression
++static int nftnl_expr_cgroupv2_snprintf(char *buf, size_t len, uint32_t type, uint32_t flags, const struct nftnl_expr *e) {
++	struct nftnl_expr_cgroupv2 *ctr = nftnl_expr_data(e);
++
++	switch (type) {
++	case NFTNL_OUTPUT_DEFAULT:
++		return snprintf(buf, len, "%s%s", (ctr->invert ? "^" : ""), ctr->cgroup);
++	case NFTNL_OUTPUT_XML:
++	case NFTNL_OUTPUT_JSON:
++	default:
++		break;
++	}
++	return -1;
++}
++
++struct expr_ops expr_ops_cgroupv2 = {
++	.name      = "cgroupv2",
++	.alloc_len = sizeof(struct nftnl_expr_cgroupv2),
++	.max_attr  = NFTA_CGROUPV2_MAX,
++	.set       = nftnl_expr_cgroupv2_set,
++	.get       = nftnl_expr_cgroupv2_get,
++	.parse     = nftnl_expr_cgroupv2_parse,
++	.build     = nftnl_expr_cgroupv2_build,
++	.snprintf  = nftnl_expr_cgroupv2_snprintf,
++};
+diff --git a/src/expr_ops.c b/src/expr_ops.c
+index 3538dd6..1c791d1 100644
+--- a/src/expr_ops.c
++++ b/src/expr_ops.c
+@@ -41,6 +41,7 @@ extern struct expr_ops expr_ops_synproxy;
+ extern struct expr_ops expr_ops_tunnel;
+ extern struct expr_ops expr_ops_osf;
+ extern struct expr_ops expr_ops_xfrm;
++extern struct expr_ops expr_ops_cgroupv2;
+ 
+ static struct expr_ops expr_ops_notrack = {
+ 	.name	= "notrack",
+@@ -85,6 +86,7 @@ static struct expr_ops *expr_ops[] = {
+ 	&expr_ops_tunnel,
+ 	&expr_ops_osf,
+ 	&expr_ops_xfrm,
++	&expr_ops_cgroupv2,
+ 	NULL,
+ };
+ 
+-- 
+2.25.4
+
