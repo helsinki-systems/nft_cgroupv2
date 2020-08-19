@@ -1,0 +1,12 @@
+# Test with:
+# - curl http://somehost:4000
+# - systemd-run --slice machine.slice --shell
+# - curl http://somehost:4000
+
+table ip test {
+	chain test {
+		type filter hook postrouting priority filter; policy accept;
+		tcp dport 4000 cgroupv2 "^/machine.slice" log prefix "negative__"
+		tcp dport 4000 cgroupv2 "/machine.slice" log prefix "positive__"
+	}
+}

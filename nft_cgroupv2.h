@@ -1,0 +1,13 @@
+#ifndef _NFT_CGROUPV2_H
+#define _NFT_CGROUPV2_H
+
+enum nft_cgroupv2_attributes {
+	NFTA_CGROUPV2_UNSPEC,
+	NFTA_CGROUPV2_CGROUP,
+	NFTA_CGROUPV2_INVERT,
+	__NFTA_CGROUPV2_MAX,
+};
+
+#define NFTA_CGROUPV2_MAX (__NFTA_CGROUPV2_MAX - 1)
+
+#endif /* _NFT_CGROUPV2_H */
